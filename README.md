@@ -1,6 +1,6 @@
 # Sentinel — Automated Linux Security Hardening & Compliance Toolkit
 
-**Sentinel** is a production-minded Linux server hardening and security automation toolkit designed to enforce baseline security policies, reduce attack surface, and generate actionable audit reports. It was built to reflect how real infrastructure and security engineers approach system hardening through automation, consistency, auditability, and repeatable enforcement.
+**Sentinel** is a production-minded Linux server hardening and security automation toolkit designed to enforce baseline security policies, reduce attack surface, and generate actionable audit reports.
 
 The goal of sentinel is not simply to “secure a system,” but to codify security best practices into a reusable, auditable, and extensible workflow. Rather than relying on manual configuration, tribal knowledge, or one-off shell commands, sentinel applies a consistent security baseline that can be safely deployed across environments and validated through automated reporting.
 
@@ -10,14 +10,12 @@ The name **Sentinel** reflects the philosophy behind the tool: a persistent guar
 
 ## Design Philosophy
 
-Linux server security is best achieved through defense in depth, automation, and repeatability. Sentinel is built around the idea that:
+Instead of abstracting away system details, sentinel operates directly on real configuration files, services, and security subsystems. This ensures that engineers using the tool are interacting with Linux as it exists in production, not a simulated or simplified environment. Sentinel is built around the idea that:
 
 - Security should be codified 
 - Hardening steps should be scriptable and reproducible  
 - Changes should be auditable and reversible  
 - Systems should be hardened consistently 
-
-Instead of abstracting away system details, sentinel operates directly on real configuration files, services, and security subsystems. This ensures that engineers using the tool are interacting with Linux as it exists in production, not a simulated or simplified environment.
 
 The project emphasizes clarity, safety, and operational realism. Every modification is backed up before being applied, validation steps are performed where possible, and detailed logging is generated for review and auditing.
 
