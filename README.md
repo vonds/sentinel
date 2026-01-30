@@ -2,7 +2,7 @@
 
 **Sentinel** is a production-minded Linux server hardening and security automation toolkit designed to enforce baseline security policies, reduce attack surface, and generate actionable audit reports.
 
-The goal of sentinel is not simply to “secure a system,” but to codify security best practices into a reusable, auditable, and extensible workflow. Rather than relying on manual configuration, tribal knowledge, or one-off shell commands, sentinel applies a consistent security baseline that can be safely deployed across environments and validated through automated reporting.
+The goal of sentinel is not simply to “secure a system,” but to codify security best practices into a reusable, auditable, and extensible workflow. Rather than relying on manual configuration, or one-off shell commands, sentinel applies a consistent security baseline that can be safely deployed across environments and validated through automated reporting.
 
 The name **Sentinel** reflects the philosophy behind the tool: a persistent guardian that enforces security posture, monitors system hygiene, and helps prevent configuration drift over time.
 
