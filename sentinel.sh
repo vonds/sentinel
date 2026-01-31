@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
 ########################################
 # Globals / Defaults
 ########################################
 DRY_RUN=0
+CHECK_ONLY=0
 FORCE=0
+STRICT_CIDR=0
 
 NO_SSH=0
 NO_FIREWALL=0
@@ -16,16 +17,16 @@ NO_AUDIT=0
 
 FINALIZE_SSH_PORT=0
 ENFORCE_PAM_PWQUALITY=0
-EMERGENCY_FIREWALL=0  # if no ufw/firewalld, allow nft/iptables "temporary emergency" mode
+EMERGENCY_FIREWALL=0
 
 SSH_PORT=22
-ALLOW_SSH_FROM=""        # e.g. "203.0.113.10/32" or "2001:db8::/64"
-DISABLE_SSH_PASSWORD=1   # key auth preferred
+ALLOW_SSH_FROM=""
+DISABLE_SSH_PASSWORD=1
 DISABLE_SSH_ROOT=1
 
 LOG_DIR="/var/log/hardening-toolkit"
-LOG_FILE=""      # set in ensure_log_dir
-REPORT_FILE=""   # set in ensure_log_dir
+LOG_FILE=""
+REPORT_FILE=""
 
 OS_ID=""
 OS_LIKE=""
@@ -39,9 +40,11 @@ usage() {
   echo
   echo "Options:"
   echo "  --dry-run                  Show what would change, do not modify system"
+  echo "  --check-only               Run validations/status checks only; no system changes"
   echo "  --force                    Skip interactive confirmations for risky changes"
   echo "  --ssh-port N               Set SSH port (default: 22)"
   echo "  --allow-ssh-from CIDR      Restrict SSH to a CIDR (e.g., 203.0.113.10/32)"
+  echo "  --strict-cidr              Require --allow-ssh-from to validate as a real CIDR (python3 ipaddress)"
   echo "  --finalize-ssh-port        Remove 22/tcp firewall allowance (after verifying new port works)"
   echo "  --keep-ssh-password        Do NOT disable SSH password authentication"
   echo "  --permit-ssh-root          Do NOT disable SSH root login"
@@ -57,6 +60,7 @@ usage() {
   echo "Examples:"
   echo "  sudo ./sentinel.sh"
   echo "  sudo ./sentinel.sh --dry-run"
+  echo "  sudo ./sentinel.sh --check-only"
   echo "  sudo ./sentinel.sh --ssh-port 2222 --allow-ssh-from 203.0.113.10/32"
   echo "  sudo ./sentinel.sh --ssh-port 2222 --finalize-ssh-port --force"
   echo "  sudo ./sentinel.sh --enforce-pam-pwquality --force"
@@ -113,8 +117,18 @@ confirm_or_die() {
   fi
 }
 
-# Safe command runner: no eval, supports dry-run printing.
 run_cmd() {
+  if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    if [[ -n "${LOG_FILE:-}" ]] && [[ -e "$LOG_FILE" ]]; then
+      printf 'CHECK-ONLY: %q ' "$@" | tee -a "$LOG_FILE" >/dev/null
+      echo | tee -a "$LOG_FILE" >/dev/null
+    else
+      printf 'CHECK-ONLY: %q ' "$@"
+      echo
+    fi
+    return 0
+  fi
+
   if [[ "$DRY_RUN" -eq 1 ]]; then
     if [[ -n "${LOG_FILE:-}" ]] && [[ -e "$LOG_FILE" ]]; then
       printf 'DRY-RUN: %q ' "$@" | tee -a "$LOG_FILE" >/dev/null
@@ -151,11 +165,13 @@ ensure_log_dir() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "Dry-run mode: log directory and log file created for safe logging."
   fi
+  if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    log "Check-only mode: will run validations and status checks only."
+  fi
 }
 
 detect_os() {
   if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
     source /etc/os-release
     OS_ID="${ID:-}"
     OS_LIKE="${ID_LIKE:-}"
@@ -179,19 +195,183 @@ detect_os() {
 backup_file() {
   local f="$1"
   [[ -f "$f" ]] || return 0
-  local b="${f}.bak.$(timestamp)"
+  local b
+  b="${f}.bak.$(timestamp)"
   run_cmd cp -a "$f" "$b"
   log "Backup: $f -> $b"
 }
 
-is_ipv4_cidr() {
-  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]
+set_kv_in_file() {
+  local file="$1" key="$2" value="$3"
+  [[ -f "$file" ]] || { warn "set_kv_in_file: file not found: $file"; return 1; }
+
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would set '${key} ${value}' in $file"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  awk -v k="$key" -v v="$value" '
+    BEGIN { found=0 }
+    $0 ~ "^[[:space:]]*"k"[[:space:]]+" {
+      print k" "v
+      found=1
+      next
+    }
+    { print }
+    END {
+      if (found==0) print k" "v
+    }
+  ' "$file" >"$tmp"
+  mv "$tmp" "$file"
 }
 
-is_ipv6_cidr() {
-  [[ "$1" == *:*/* ]]
+cidr_is_valid() {
+  local cidr="$1"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY' "$cidr" >/dev/null 2>&1
+import sys, ipaddress
+try:
+  ipaddress.ip_network(sys.argv[1], strict=False)
+  sys.exit(0)
+except Exception:
+  sys.exit(1)
+PY
+    return $?
+  fi
+
+  if [[ "${STRICT_CIDR:-0}" -eq 1 ]]; then
+    return 1
+  fi
+
+  [[ "$cidr" == */* ]] && return 0
+  return 1
 }
 
+cidr_family() {
+  local cidr="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY' "$cidr" 2>/dev/null
+import sys, ipaddress
+n = ipaddress.ip_network(sys.argv[1], strict=False)
+print("ipv6" if n.version == 6 else "ipv4")
+PY
+    return 0
+  fi
+
+  if [[ "$cidr" == *:*/* ]]; then
+    echo "ipv6"
+  elif [[ "$cidr" == *.*/* ]]; then
+    echo "ipv4"
+  else
+    echo "unknown"
+  fi
+}
+
+ssh_lockout_preflight() {
+  if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]]; then
+    if [[ "$DISABLE_SSH_PASSWORD" -eq 1 ]]; then
+      confirm_or_die "You appear to be running this over SSH and this will DISABLE SSH password auth. Confirm your key works in a separate session before continuing."
+    fi
+  fi
+}
+
+########################################
+# Managed block upsert helper
+########################################
+upsert_managed_block() {
+  # Upsert a delimited block in a text config file.
+  local file="$1" begin="$2" end="$3" block="$4"
+
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would upsert managed block in $file"
+    echo "----- $file managed block -----"
+    echo "$begin"
+    echo -e "$block"
+    echo "$end"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$file")"
+
+  if [[ -f "$file" ]]; then
+    backup_file "$file" || true
+  else
+    : >"$file"
+  fi
+
+  if grep -qF "$begin" "$file"; then
+    perl -0777 -i -pe "s/\\Q$begin\\E.*?\\Q$end\\E\\n?//sg" "$file" >>"$LOG_FILE" 2>&1 || true
+  fi
+
+  {
+    echo
+    echo "$begin"
+    echo -e "$block"
+    echo "$end"
+  } >>"$file"
+}
+
+########################################
+# CHECK-ONLY report
+########################################
+check_only_report() {
+  log "=== CHECK-ONLY MODE: validations + status ==="
+
+  log "OS detection:"
+  log "  ID='${OS_ID}' LIKE='${OS_LIKE}' PKG_MGR='${PKG_MGR}'"
+
+  log "SSH effective config (if sshd present):"
+  if command -v sshd >/dev/null 2>&1; then
+    if sshd -t >>"$LOG_FILE" 2>&1; then
+      log "  sshd -t: OK"
+    else
+      warn "  sshd -t: FAILED (see $LOG_FILE)"
+    fi
+
+    local eff
+    eff="$(sshd -T 2>/dev/null | grep -E '^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|usepam)\b' || true)"
+    log "  sshd -T (effective):"
+    echo "$eff" | while IFS= read -r line; do log "    $line"; done
+  else
+    warn "  sshd not found"
+  fi
+
+  log "Firewall status:"
+  if command -v ufw >/dev/null 2>&1; then
+    ufw status verbose 2>/dev/null | while IFS= read -r line; do log "    $line"; done
+  elif command -v firewall-cmd >/dev/null 2>&1; then
+    log "  firewalld active: $(systemctl is-active firewalld 2>/dev/null || echo unknown)"
+    firewall-cmd --list-all 2>/dev/null | while IFS= read -r line; do log "    $line"; done
+  elif command -v nft >/dev/null 2>&1; then
+    nft list ruleset 2>/dev/null | head -n 60 | while IFS= read -r line; do log "    $line"; done
+  elif command -v iptables >/dev/null 2>&1; then
+    iptables -S 2>/dev/null | head -n 60 | while IFS= read -r line; do log "    $line"; done
+  else
+    warn "  No firewall tooling found"
+  fi
+
+  log "Password policy status:"
+  if [[ -f /etc/security/pwquality.conf ]]; then
+    grep -E '^\s*(minlen|dcredit|ucredit|lcredit|ocredit|difok|dictcheck|gecoscheck|enforcing)\s*=' /etc/security/pwquality.conf 2>/dev/null \
+      | while IFS= read -r line; do log "    $line"; done
+  else
+    warn "  /etc/security/pwquality.conf not found"
+  fi
+
+  log "Open listeners snapshot:"
+  if command -v ss >/dev/null 2>&1; then
+    ss -tulpn 2>/dev/null | head -n 50 | while IFS= read -r line; do log "    $line"; done
+  fi
+
+  log "CHECK-ONLY complete."
+}
+
+########################################
+# Package helpers
+########################################
 pkg_installed() {
   local pkg="$1"
   if command -v dpkg >/dev/null 2>&1; then
@@ -236,21 +416,11 @@ ensure_pkg() {
 }
 
 ########################################
-# Desired-state firewall helpers (idempotent)
+# Desired-state firewall helpers
 ########################################
-ufw_rule_exists() {
-  # returns 0 if rule appears in ufw status output (best-effort)
-  local needle="$1"
-  ufw status 2>/dev/null | grep -Fq "$needle"
-}
-
 ufw_allow_port() {
   local port="$1"
-  if ufw status 2>/dev/null | grep -qi inactive; then
-    :
-  fi
 
-  # UFW prints rules with varying formatting; check both common patterns.
   if ufw status 2>/dev/null | grep -Eq "(^|[[:space:]])${port}/tcp([[:space:]]|$)"; then
     log "UFW: rule for ${port}/tcp already present."
     return 0
@@ -259,28 +429,41 @@ ufw_allow_port() {
   run_cmd ufw allow "${port}/tcp"
 }
 
+ufw_source_rule_exists() {
+  local cidr="$1" port="$2"
+  ufw status numbered 2>/dev/null \
+    | tr -s ' ' \
+    | grep -Eiq "^\[[0-9]+\][[:space:]]+${port}/tcp[[:space:]]+ALLOW IN[[:space:]]+${cidr//\//\\/}"
+}
+
 ufw_allow_from_to_port() {
   local cidr="$1" port="$2"
 
-  # For source-restricted rules, UFW output formatting is even more variable.
-  # Use a best-effort grep to avoid duplicates; still safe if duplicates happen.
-  local needle="ALLOW IN"
-  if ufw status 2>/dev/null | grep -Fq "$cidr" && ufw status 2>/dev/null | grep -Fq "${port}/tcp"; then
-    log "UFW: source-restricted rule for ${cidr} -> ${port}/tcp appears present."
+  if ufw_source_rule_exists "$cidr" "$port"; then
+    log "UFW: source-restricted rule for ${cidr} -> ${port}/tcp already present."
     return 0
   fi
 
   run_cmd ufw allow from "$cidr" to any port "$port" proto tcp
 }
 
-ufw_delete_allow_port() {
+ufw_delete_allow_port_any_source() {
   local port="$1"
-  # Deleting safely: attempt delete; if not present, ignore.
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would attempt to delete UFW allow ${port}/tcp (if present)"
+
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would delete any UFW allow rules for ${port}/tcp (all sources)"
     return 0
   fi
-  run_cmd ufw --force delete allow "${port}/tcp" || true
+
+  while true; do
+    local num
+    num="$(ufw status numbered 2>/dev/null \
+      | tr -s ' ' \
+      | awk -v p="${port}/tcp" '$0 ~ p && $0 ~ /ALLOW IN/ { gsub(/^\[|\].*$/,"",$1); print $1; exit }')"
+
+    [[ -n "${num:-}" ]] || break
+    run_cmd ufw --force delete "$num" || true
+  done
 }
 
 firewalld_port_enabled() {
@@ -299,8 +482,8 @@ firewalld_add_port() {
 
 firewalld_remove_port() {
   local port="$1"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would remove firewalld port ${port}/tcp if present"
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would remove firewalld port ${port}/tcp if present"
     return 0
   fi
   run_cmd firewall-cmd --permanent --remove-port="${port}/tcp" || true
@@ -322,8 +505,8 @@ firewalld_add_rich_rule() {
 
 firewalld_remove_rich_rule() {
   local rule="$1"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would remove firewalld rich rule if present: $rule"
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would remove firewalld rich rule if present: $rule"
     return 0
   fi
   run_cmd firewall-cmd --permanent --remove-rich-rule "$rule" || true
@@ -333,7 +516,6 @@ firewalld_remove_rich_rule() {
 # SSH Config Management (safer)
 ########################################
 write_sshd_managed_config() {
-  # Prefer drop-in if available; otherwise insert a managed block BEFORE first Match.
   local dropin_dir="/etc/ssh/sshd_config.d"
   local dropin_file="${dropin_dir}/10-sentinel.conf"
   local sshd_cfg="/etc/ssh/sshd_config"
@@ -359,10 +541,10 @@ write_sshd_managed_config() {
   managed+="LoginGraceTime 30\n"
   managed+="UseDNS no\n"
 
-  if [[ -d "$dropin_dir" || "$DRY_RUN" -eq 1 ]]; then
+  if [[ -d "$dropin_dir" || "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
     log "Using sshd drop-in config: $dropin_file"
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-      log "DRY-RUN: would write $dropin_file"
+    if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+      log "DRY-RUN/CHECK-ONLY: would write $dropin_file"
       echo "----- $dropin_file -----"
       echo -e "$managed"
     else
@@ -382,8 +564,8 @@ write_sshd_managed_config() {
   local begin="# BEGIN sentinel.sh managed block"
   local end="# END sentinel.sh managed block"
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would upsert managed block in $sshd_cfg"
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would upsert managed block in $sshd_cfg"
     echo "----- managed block -----"
     echo "$begin"
     echo -e "$managed"
@@ -429,7 +611,7 @@ write_sshd_managed_config() {
 }
 
 ########################################
-# 1) Firewall Configuration (safer + idempotent desired-state)
+# 1) Firewall Configuration
 ########################################
 configure_firewall() {
   log "=== Firewall Configuration ==="
@@ -446,13 +628,11 @@ configure_firewall() {
   fi
 
   if command -v ufw >/dev/null 2>&1; then
-    log "Using UFW (non-destructive; idempotent allow rules)."
+    log "Using UFW (non-destructive; desired-state rules)."
 
-    # Defaults (may still be impactful but are predictable).
     run_cmd ufw default deny incoming
     run_cmd ufw default allow outgoing
 
-    # Ensure SSH allows
     if [[ -n "$ALLOW_SSH_FROM" ]]; then
       ufw_allow_from_to_port "$ALLOW_SSH_FROM" "$SSH_PORT"
       if [[ "$SSH_PORT" -ne 22 && "$FINALIZE_SSH_PORT" -eq 0 ]]; then
@@ -465,16 +645,14 @@ configure_firewall() {
       fi
     fi
 
-    # Enable if inactive
     if ufw status 2>/dev/null | head -n1 | grep -qi inactive; then
       run_cmd ufw --force enable
     fi
 
-    # Finalize: remove 22/tcp allowance (best-effort)
     if [[ "$FINALIZE_SSH_PORT" -eq 1 && "$SSH_PORT" -ne 22 ]]; then
       confirm_or_die "Finalizing SSH port transition will REMOVE 22/tcp from the firewall. Ensure you can SSH on port ${SSH_PORT} first."
-      ufw_delete_allow_port 22
-      log "Finalize complete (UFW): attempted removal of 22/tcp."
+      ufw_delete_allow_port_any_source 22
+      log "Finalize complete (UFW): removed any allow rules for 22/tcp."
     fi
 
     run_cmd ufw status verbose
@@ -488,14 +666,16 @@ configure_firewall() {
     run_cmd firewall-cmd --set-default-zone=public
 
     if [[ -n "$ALLOW_SSH_FROM" ]]; then
-      if is_ipv4_cidr "$ALLOW_SSH_FROM"; then
+      local fam
+      fam="$(cidr_family "$ALLOW_SSH_FROM")"
+      if [[ "$fam" == "ipv4" ]]; then
         local rule_v4
         rule_v4="rule family=ipv4 source address=${ALLOW_SSH_FROM} port port=${SSH_PORT} protocol=tcp accept"
         firewalld_add_rich_rule "$rule_v4"
         if [[ "$SSH_PORT" -ne 22 && "$FINALIZE_SSH_PORT" -eq 0 ]]; then
           firewalld_add_rich_rule "rule family=ipv4 source address=${ALLOW_SSH_FROM} port port=22 protocol=tcp accept"
         fi
-      elif is_ipv6_cidr "$ALLOW_SSH_FROM"; then
+      elif [[ "$fam" == "ipv6" ]]; then
         local rule_v6
         rule_v6="rule family=ipv6 source address=${ALLOW_SSH_FROM} port port=${SSH_PORT} protocol=tcp accept"
         firewalld_add_rich_rule "$rule_v6"
@@ -503,7 +683,7 @@ configure_firewall() {
           firewalld_add_rich_rule "rule family=ipv6 source address=${ALLOW_SSH_FROM} port port=22 protocol=tcp accept"
         fi
       else
-        warn "ALLOW_SSH_FROM does not look like a valid IPv4/IPv6 CIDR. Using port allowances instead."
+        warn "ALLOW_SSH_FROM not recognized as IPv4/IPv6 CIDR. Using port allowances instead."
         firewalld_add_port "$SSH_PORT"
         if [[ "$SSH_PORT" -ne 22 && "$FINALIZE_SSH_PORT" -eq 0 ]]; then
           firewalld_add_port 22
@@ -516,22 +696,18 @@ configure_firewall() {
       fi
     fi
 
-    # Finalize: remove 22 allowances (ports and/or rich rules)
     if [[ "$FINALIZE_SSH_PORT" -eq 1 && "$SSH_PORT" -ne 22 ]]; then
       confirm_or_die "Finalizing SSH port transition will REMOVE 22/tcp from the firewall. Ensure you can SSH on port ${SSH_PORT} first."
-
-      # Remove port if present
       firewalld_remove_port 22
-
-      # Remove common rich rule patterns (v4 and v6) if ALLOW_SSH_FROM was used
       if [[ -n "$ALLOW_SSH_FROM" ]]; then
-        if is_ipv4_cidr "$ALLOW_SSH_FROM"; then
+        local fam2
+        fam2="$(cidr_family "$ALLOW_SSH_FROM")"
+        if [[ "$fam2" == "ipv4" ]]; then
           firewalld_remove_rich_rule "rule family=ipv4 source address=${ALLOW_SSH_FROM} port port=22 protocol=tcp accept"
-        elif is_ipv6_cidr "$ALLOW_SSH_FROM"; then
+        elif [[ "$fam2" == "ipv6" ]]; then
           firewalld_remove_rich_rule "rule family=ipv6 source address=${ALLOW_SSH_FROM} port port=22 protocol=tcp accept"
         fi
       fi
-
       log "Finalize complete (firewalld): attempted removal of 22/tcp."
     fi
 
@@ -551,12 +727,10 @@ configure_firewall() {
 
   confirm_or_die "Emergency firewall fallback will apply TEMPORARY rules (non-persistent). This is for short-lived recovery use only."
 
-  # Prefer nft if available; otherwise iptables.
   if command -v nft >/dev/null 2>&1; then
     warn "Using nftables emergency fallback (TEMPORARY). Consider persisting rules via distro tooling after validation."
     run_cmd nft list ruleset || true
 
-    # Minimal table/chain approach; safe-ish and reversible by flushing table.
     run_cmd nft add table inet sentinel 2>/dev/null || true
     run_cmd nft 'add chain inet sentinel input { type filter hook input priority 0; policy drop; }' 2>/dev/null || true
 
@@ -564,13 +738,14 @@ configure_firewall() {
     run_cmd nft add rule inet sentinel input ct state established,related accept 2>/dev/null || true
 
     if [[ -n "$ALLOW_SSH_FROM" ]]; then
-      # nft can handle both v4/v6 in inet table with "ip saddr" vs "ip6 saddr".
-      if is_ipv4_cidr "$ALLOW_SSH_FROM"; then
+      local fam3
+      fam3="$(cidr_family "$ALLOW_SSH_FROM")"
+      if [[ "$fam3" == "ipv4" ]]; then
         run_cmd nft add rule inet sentinel input ip saddr "$ALLOW_SSH_FROM" tcp dport "$SSH_PORT" accept 2>/dev/null || true
         if [[ "$SSH_PORT" -ne 22 && "$FINALIZE_SSH_PORT" -eq 0 ]]; then
           run_cmd nft add rule inet sentinel input ip saddr "$ALLOW_SSH_FROM" tcp dport 22 accept 2>/dev/null || true
         fi
-      elif is_ipv6_cidr "$ALLOW_SSH_FROM"; then
+      elif [[ "$fam3" == "ipv6" ]]; then
         run_cmd nft add rule inet sentinel input ip6 saddr "$ALLOW_SSH_FROM" tcp dport "$SSH_PORT" accept 2>/dev/null || true
         if [[ "$SSH_PORT" -ne 22 && "$FINALIZE_SSH_PORT" -eq 0 ]]; then
           run_cmd nft add rule inet sentinel input ip6 saddr "$ALLOW_SSH_FROM" tcp dport 22 accept 2>/dev/null || true
@@ -636,6 +811,8 @@ harden_ssh() {
   warn "SSH changes can lock you out. Ensure you have key auth + an open session before applying remotely."
   warn "Firewall was configured before this step to reduce lockout risk."
 
+  ssh_lockout_preflight
+
   if [[ "$DISABLE_SSH_PASSWORD" -eq 1 ]]; then
     confirm_or_die "This will DISABLE SSH password auth. Ensure you have working SSH keys before continuing."
   fi
@@ -646,8 +823,8 @@ harden_ssh() {
   write_sshd_managed_config || { warn "Failed to write SSH managed config; skipping SSH restart."; return 1; }
 
   if command -v sshd >/dev/null 2>&1; then
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-      log "DRY-RUN: would validate sshd config (sshd -t) and restart sshd"
+    if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+      log "DRY-RUN/CHECK-ONLY: would validate sshd config (sshd -t) and restart sshd"
     else
       if ! sshd -t >>"$LOG_FILE" 2>&1; then
         die "sshd config validation failed. Check $LOG_FILE and restore backup if needed."
@@ -699,8 +876,8 @@ harden_sudo() {
   content+="# Optional: set a consistent secure path (adjust to your environment)\n"
   content+="Defaults secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n"
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would write $hard_file and create /var/log/sudo-io"
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would write $hard_file and create /var/log/sudo-io"
     echo "----- $hard_file (new) -----"
     echo -e "$content"
   else
@@ -723,9 +900,6 @@ harden_sudo() {
 # 4) Password Policies (+ optional PAM wiring)
 ########################################
 detect_pam_stack_file() {
-  # Returns the most likely PAM password stack file path, or empty.
-  # Debian/Ubuntu: /etc/pam.d/common-password
-  # RHEL/Fedora:   /etc/pam.d/system-auth (often via authselect) and /etc/pam.d/password-auth
   if [[ -f /etc/pam.d/common-password ]]; then
     echo "/etc/pam.d/common-password"
     return 0
@@ -752,16 +926,22 @@ pam_insert_pwquality() {
     return 0
   fi
 
-  confirm_or_die "PAM enforcement will modify $f. Incorrect PAM edits can lock users out."
+  if command -v authselect >/dev/null 2>&1; then
+    if authselect current 2>/dev/null | grep -qi 'Profile ID'; then
+      warn "authselect detected. Manual edits to $f may be overwritten."
+      warn "Consider using authselect custom profiles for persistent PAM changes."
+      confirm_or_die "Proceed anyway with manual PAM edit to $f (may be overwritten by authselect)."
+    fi
+  fi
 
+  confirm_or_die "PAM enforcement will modify $f. Incorrect PAM edits can lock users out."
   backup_file "$f"
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would add pam_pwquality to $f"
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would add pam_pwquality to $f"
     return 0
   fi
 
-  # Insert pwquality line before first pam_unix password line if present; else append.
   local tmp
   tmp="$(mktemp)"
   awk '
@@ -783,41 +963,32 @@ pam_insert_pwquality() {
 enforce_password_policies() {
   log "=== Password Policy Enforcement ==="
 
-  # Install common pwquality packages (name differs across distros).
   ensure_pkg "libpam-pwquality" || true
   ensure_pkg "pam_pwquality" || true
   ensure_pkg "libpwquality" || true
   ensure_pkg "pwquality" || true
 
   local pwq="/etc/security/pwquality.conf"
-  if [[ -f "$pwq" ]]; then
-    backup_file "$pwq"
-  fi
+  local begin_pwq="# BEGIN sentinel.sh managed pwquality"
+  local end_pwq="# END sentinel.sh managed pwquality"
 
-  local pwq_content=""
-  pwq_content+="# pwquality.conf — password quality requirements\n"
-  pwq_content+="# Managed by sentinel.sh\n"
-  pwq_content+="# These are reasonable baseline settings; tune per policy.\n"
-  pwq_content+="minlen = 14\n"
-  pwq_content+="dcredit = -1\n"
-  pwq_content+="ucredit = -1\n"
-  pwq_content+="lcredit = -1\n"
-  pwq_content+="ocredit = -1\n"
-  pwq_content+="maxrepeat = 3\n"
-  pwq_content+="maxclassrepeat = 3\n"
-  pwq_content+="difok = 4\n"
-  pwq_content+="gecoscheck = 1\n"
-  pwq_content+="dictcheck = 1\n"
-  pwq_content+="enforcing = 1\n"
+  local pwq_block=""
+  pwq_block+="# pwquality settings (baseline). Tune per policy.\n"
+  pwq_block+="minlen = 14\n"
+  pwq_block+="dcredit = -1\n"
+  pwq_block+="ucredit = -1\n"
+  pwq_block+="lcredit = -1\n"
+  pwq_block+="ocredit = -1\n"
+  pwq_block+="maxrepeat = 3\n"
+  pwq_block+="maxclassrepeat = 3\n"
+  pwq_block+="difok = 4\n"
+  pwq_block+="gecoscheck = 1\n"
+  pwq_block+="dictcheck = 1\n"
+  pwq_block+="enforcing = 1\n"
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would write/update $pwq"
-    echo "----- $pwq -----"
-    echo -e "$pwq_content"
-  else
-    mkdir -p /etc/security
-    echo -e "$pwq_content" >"$pwq"
-    chmod 644 "$pwq"
+  upsert_managed_block "$pwq" "$begin_pwq" "$end_pwq" "$pwq_block"
+  if [[ "$DRY_RUN" -ne 1 && "$CHECK_ONLY" -ne 1 ]]; then
+    chmod 644 "$pwq" || true
   fi
 
   local login_defs="/etc/login.defs"
@@ -830,12 +1001,11 @@ enforce_password_policies() {
     warn "Missing /etc/login.defs; skipping aging defaults."
   fi
 
-  # Safer than appending to /etc/profile: use a dedicated profile.d file.
   local umask_file="/etc/profile.d/99-sentinel-umask.sh"
   local umask_content="# Managed by sentinel.sh\numask 027\n"
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would write $umask_file"
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would write $umask_file"
     echo "----- $umask_file -----"
     echo -e "$umask_content"
   else
@@ -844,7 +1014,6 @@ enforce_password_policies() {
     chmod 644 "$umask_file"
   fi
 
-  # Optional PAM wiring (careful)
   if [[ "$ENFORCE_PAM_PWQUALITY" -eq 1 ]]; then
     local pam_file
     pam_file="$(detect_pam_stack_file || true)"
@@ -853,11 +1022,10 @@ enforce_password_policies() {
       warn "On RHEL-like systems, consider authselect-managed stacks (system-auth/password-auth)."
     else
       warn "PAM enforcement requested. Target file: $pam_file"
-      warn "If this system uses authselect (RHEL), manual edits may be overwritten."
       pam_insert_pwquality "$pam_file"
     fi
   else
-    warn "Note: pwquality.conf was written, but PAM enforcement is not guaranteed unless --enforce-pam-pwquality is used."
+    warn "Note: pwquality.conf managed block applied, but PAM enforcement is not guaranteed unless --enforce-pam-pwquality is used."
   fi
 
   log "Password policy enforcement done."
@@ -884,7 +1052,7 @@ audit_system_security() {
     out+="PasswordAuthentication (base file): $(grep -E '^\s*PasswordAuthentication\s+' /etc/ssh/sshd_config 2>/dev/null | tail -n1 | awk '{print $2}' || echo "unknown")\n"
     if [[ -d /etc/ssh/sshd_config.d ]]; then
       out+="sshd_config.d present: yes\n"
-      out+="sshd drop-ins:\n$(ls -1 /etc/ssh/sshd_config.d 2>/dev/null | head -n 50)\n"
+      out+="sshd drop-ins:\n$(find /etc/ssh/sshd_config.d -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort | head -n 50)\n"
     else
       out+="sshd_config.d present: no\n"
     fi
@@ -990,8 +1158,8 @@ audit_system_security() {
   fi
   out+="\n"
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would write report to $REPORT_FILE"
+  if [[ "$DRY_RUN" -eq 1 || "$CHECK_ONLY" -eq 1 ]]; then
+    log "DRY-RUN/CHECK-ONLY: would write report to $REPORT_FILE"
     echo -e "$out"
   else
     echo -e "$out" >"$REPORT_FILE"
@@ -1006,18 +1174,31 @@ audit_system_security() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift;;
+    --check-only) CHECK_ONLY=1; shift;;
     --force) FORCE=1; shift;;
+    --strict-cidr) STRICT_CIDR=1; shift;;
+
     --ssh-port)
       SSH_PORT="${2:-}"
       [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "--ssh-port requires a number"
       [[ "$SSH_PORT" -ge 1 && "$SSH_PORT" -le 65535 ]] || die "--ssh-port must be 1-65535"
       shift 2
       ;;
+
     --allow-ssh-from)
       ALLOW_SSH_FROM="${2:-}"
       [[ -n "$ALLOW_SSH_FROM" ]] || die "--allow-ssh-from requires CIDR"
+
+      if ! cidr_is_valid "$ALLOW_SSH_FROM"; then
+        if [[ "$STRICT_CIDR" -eq 1 ]]; then
+          die "--allow-ssh-from must be a valid CIDR (python3 ipaddress). Install python3 or omit --strict-cidr."
+        fi
+        warn "--allow-ssh-from does not validate as a CIDR on this system (python3 missing or invalid input). Continuing best-effort."
+      fi
+
       shift 2
       ;;
+
     --finalize-ssh-port) FINALIZE_SSH_PORT=1; shift;;
     --keep-ssh-password) DISABLE_SSH_PASSWORD=0; shift;;
     --permit-ssh-root) DISABLE_SSH_ROOT=0; shift;;
@@ -1040,10 +1221,16 @@ need_root
 ensure_log_dir
 detect_os
 
-log "Sentinel starting (dry-run=$DRY_RUN)"
-log "Settings: ssh_port=$SSH_PORT allow_ssh_from='${ALLOW_SSH_FROM:-none}' disable_ssh_password=$DISABLE_SSH_PASSWORD disable_ssh_root=$DISABLE_SSH_ROOT finalize_ssh_port=$FINALIZE_SSH_PORT enforce_pam_pwquality=$ENFORCE_PAM_PWQUALITY emergency_firewall=$EMERGENCY_FIREWALL"
+log "Sentinel starting (dry-run=$DRY_RUN check-only=$CHECK_ONLY)"
+log "Settings: ssh_port=$SSH_PORT allow_ssh_from='${ALLOW_SSH_FROM:-none}' disable_ssh_password=$DISABLE_SSH_PASSWORD disable_ssh_root=$DISABLE_SSH_ROOT finalize_ssh_port=$FINALIZE_SSH_PORT enforce_pam_pwquality=$ENFORCE_PAM_PWQUALITY emergency_firewall=$EMERGENCY_FIREWALL strict_cidr=$STRICT_CIDR"
 
-# Safer ordering: firewall first, then SSH.
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  check_only_report
+  log "Sentinel complete (check-only)."
+  log "Log file: $LOG_FILE"
+  exit 0
+fi
+
 if [[ "$NO_FIREWALL" -eq 0 ]]; then configure_firewall; else log "Skipping firewall configuration."; fi
 if [[ "$NO_SSH" -eq 0 ]]; then harden_ssh; else log "Skipping SSH hardening."; fi
 if [[ "$NO_SUDO" -eq 0 ]]; then harden_sudo; else log "Skipping sudo hardening."; fi
