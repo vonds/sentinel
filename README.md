@@ -129,7 +129,7 @@ Planned expansions include:
 - Centralized logging pipelines
 - Ansible automation modules
 
-## What Still Needs Work (Roadmap / TODO)
+## What Still Needs Work
 
 This project is usable today, but it is intentionally conservative and still evolving. Below are the most important remaining work items, grouped by priority.
 
