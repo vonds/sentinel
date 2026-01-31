@@ -6,7 +6,6 @@ The goal of Sentinel is not simply to “secure a system,” but to codify secur
 
 The name **Sentinel** reflects the philosophy behind the tool: a persistent guardian that enforces security posture, monitors system hygiene, and helps prevent configuration drift over time.
 
----
 
 ## Design Philosophy
 
@@ -19,7 +18,6 @@ Instead of abstracting away system details, Sentinel operates directly on real c
 
 The project emphasizes clarity, safety, and operational realism. Every modification is backed up before being applied, validation steps are performed where possible, and detailed logging is generated for review and auditing.
 
----
 
 ## What Sentinel Does
 
@@ -58,7 +56,6 @@ Sentinel automates five core areas of Linux system hardening:
 
 Each hardening stage can be enabled or disabled independently, allowing Sentinel to be used flexibly across development, staging, and production environments.
 
----
 
 ### Read This First
 
