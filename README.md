@@ -136,7 +136,7 @@ Planned expansions include:
 
 This project is usable today, but it is intentionally conservative and still evolving. Below are the most important remaining work items, grouped by priority.
 
-### 1) Safety, Rollback, and Operational Guarantees
+### Safety, Rollback, and Operational Guarantees
 - **Add a clear rollback mode** (example: `--rollback` or `--restore-backups`) to revert:
   - SSH drop-in / managed block
   - sudoers drop-in
@@ -148,7 +148,7 @@ This project is usable today, but it is intentionally conservative and still evo
   - Validate that the chosen SSH port is open and listening before finalizing removal of port 22
 - **Make changes more atomic** where possible (write temp → validate → swap) to reduce partial-config states after failure.
 
-### 2) SSH Hardening Improvements
+### SSH Hardening Improvements
 - **Broaden distro support for sshd config**:
   - Confirm drop-in directory behavior across major distros (Debian/Ubuntu, RHEL, SUSE)
   - Add detection and warnings for systems that do not honor `sshd_config.d`
@@ -159,7 +159,7 @@ This project is usable today, but it is intentionally conservative and still evo
 - **Improve reporting**:
   - Report *effective* SSH settings via `sshd -T` in the audit report, not only base file greps.
 
-### 3) Firewall Strategy and Port-Migration Hardening
+### Firewall Strategy and Port-Migration Hardening
 - **Make port migration more explicit and safer**:
   - Add a built-in “two-session” checklist printed before disabling password auth or removing port 22
   - Add an optional “verify SSH on new port” check (best-effort) before `--finalize-ssh-port`
@@ -168,7 +168,7 @@ This project is usable today, but it is intentionally conservative and still evo
   - Consider support for nftables persistence (optional) rather than only temporary emergency mode
   - Optional support for common cloud firewall tooling guidance (UFW/firewalld are local-only)
 
-### 4) PAM / Password Policy Robustness
+### PAM / Password Policy Robustness
 - **Reduce lockout risk for PAM edits**:
   - Improve PAM stack detection (RHEL: `password-auth`, `system-auth`; Debian: `common-password`)
   - Add distro-specific implementation notes and safer insertion logic
@@ -178,7 +178,7 @@ This project is usable today, but it is intentionally conservative and still evo
 - **Policy customization**:
   - Make pwquality values configurable via flags or a config file rather than hard-coded defaults.
 
-### 5) Audit Report Quality and Structure
+### Audit Report Quality and Structure
 - **Improve signal-to-noise**:
   - Group results into “PASS/WARN/FAIL” sections
   - Add a summary header of key posture changes (SSH port, root login, password auth, firewall status)
@@ -186,7 +186,7 @@ This project is usable today, but it is intentionally conservative and still evo
   - Prefer structured commands where available (e.g., `sshd -T`, `firewall-cmd --list-all`, `ufw status numbered`)
   - Avoid brittle greps of base config files where the effective config differs
 
-### 6) Test Coverage and CI
+### Test Coverage and CI
 - **Add automated linting**:
   - ShellCheck in CI (GitHub Actions)
   - shfmt formatting checks
@@ -196,14 +196,14 @@ This project is usable today, but it is intentionally conservative and still evo
 - **Add a “demo mode” harness**:
   - Run against a mock filesystem (or a temp root) to validate file edits without touching `/etc`.
 
-### 7) UX / CLI Ergonomics
+### UX / CLI Ergonomics
 - **Add a config file option** (example: `--config sentinel.conf`) so common settings don’t require long flags
 - **Improve output readability**:
   - Consistent section headers and bullet summaries
   - Clear “what changed” vs “what was detected”
 - **Add `--version` and `--print-effective-settings`** for easier troubleshooting.
 
-### 8) Platform and Environment Support
+### Platform and Environment Support
 - **macOS clarification**:
   - Explicitly document that this is primarily a Linux server hardening tool (macOS use is limited and different).
 - **Systemd vs non-systemd**:
