@@ -1,4 +1,4 @@
-# Sentinel — Automated Linux Security Hardening & Compliance Toolkit
+# Sentinel: Automated Linux Security Hardening & Compliance Toolkit
 
 **Sentinel** is a production-minded Linux server hardening and security automation toolkit designed to enforce baseline security policies, reduce attack surface, and generate actionable audit reports.
 
